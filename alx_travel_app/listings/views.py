@@ -1,68 +1,113 @@
-# alx_travel_app/listings/views.py
+# listings/views.py
+from django.utils import timezone
+from rest_framework import viewsets, permissions, filters, status
+from rest_framework.response import Response
+from rest_framework.decorators import action
 
-from rest_framework import generics, permissions
-from django.shortcuts import get_object_or_404
 from .models import Listing, Booking
-from .serializers import ListingSerializer, BookingCreateSerializer, BookingSerializer
+from .serializers import ListingSerializer, BookingSerializer
 
-class ListingListCreateAPIView(generics.ListCreateAPIView):
+
+class IsOwnerOrReadOnly(permissions.BasePermission):
     """
-    GET: list active listings
-    POST: create a listing (host is taken from request.user)
+    Read for anyone; write only for the owner (assumes Listing has `owner` FK to User).
+    If your model has a different ownership field or none, adjust or remove this.
     """
-    queryset = Listing.objects.filter(is_active=True)
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        owner = getattr(obj, "owner", None)
+        return owner == request.user if owner is not None else True
+
+
+class ListingViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for listings.
+    Common query params:
+      - search: free-text on title, location, description
+      - ordering: price_per_night, -price_per_night, created_at, -created_at
+      - min_price / max_price: numeric filters on price_per_night
+      - available: true/false (simple filter if you keep a boolean on the model)
+    """
+    queryset = Listing.objects.all().order_by("-id")
     serializer_class = ListingSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
-
-    def perform_create(self, serializer):
-        serializer.save(host=self.request.user)
-
-
-class ListingRetrieveAPIView(generics.RetrieveAPIView):
-    """
-    GET: retrieve a single listing by pk
-    """
-    queryset = Listing.objects.all()
-    serializer_class = ListingSerializer
-    permission_classes = [permissions.AllowAny]
-
-
-class BookingCreateAPIView(generics.CreateAPIView):
-    """
-    POST: create a booking. If authenticated, guest is set to request.user.
-    """
-    serializer_class = BookingCreateSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def perform_create(self, serializer):
-        # set the guest to the authenticated user
-        serializer.save(guest=self.request.user)
-
-
-class BookingRetrieveAPIView(generics.RetrieveAPIView):
-    """
-    GET: retrieve booking details (only owner or staff should access in real apps)
-    """
-    queryset = Booking.objects.all()
-    serializer_class = BookingSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_object(self):
-        obj = super().get_object()
-        # basic protection: only guest or host or staff can view
-        user = self.request.user
-        if user.is_staff or obj.guest == user or obj.listing.host == user:
-            return obj
-        # else, return 404 to avoid leaking existence
-        raise generics.Http404
-
-
-class UserBookingListAPIView(generics.ListAPIView):
-    """
-    GET: list bookings for the authenticated user (as guest)
-    """
-    serializer_class = BookingSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly, IsOwnerOrReadOnly]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["title", "location", "description"]
+    ordering_fields = ["price_per_night", "created_at", "updated_at"]
 
     def get_queryset(self):
-        return Booking.objects.filter(guest=self.request.user).order_by("-created_at")
+        qs = super().get_queryset()
+        min_price = self.request.query_params.get("min_price")
+        max_price = self.request.query_params.get("max_price")
+        available = self.request.query_params.get("available")
+
+        if min_price:
+            qs = qs.filter(price_per_night__gte=min_price)
+        if max_price:
+            qs = qs.filter(price_per_night__lte=max_price)
+        if available is not None:
+            val = str(available).lower() in ("true", "1", "yes", "y")
+            if hasattr(Listing, "available"):
+                qs = qs.filter(available=val)
+        return qs
+
+    def perform_create(self, serializer):
+        # If your model has `owner`, set it here. Otherwise remove this method.
+        owner_field = Listing._meta.get_field("owner") if "owner" in [f.name for f in Listing._meta.fields] else None
+        if owner_field:
+            serializer.save(owner=self.request.user)
+        else:
+            serializer.save()
+
+    @action(detail=True, methods=["get"], url_path="bookings")
+    def bookings(self, request, pk=None):
+        """Optional: list bookings for a listing: GET /api/listings/{id}/bookings/"""
+        listing = self.get_object()
+        qs = Booking.objects.filter(listing=listing).order_by("-start_date")
+        page = self.paginate_queryset(qs)
+        serializer = BookingSerializer(page or qs, many=True)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
+
+class BookingViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for bookings.
+    Query params:
+      - listing: filter by listing id
+      - from / to: ISO dates to filter bookings that overlap a date range (optional)
+    """
+    queryset = Booking.objects.select_related("listing").all().order_by("-id")
+    serializer_class = BookingSerializer
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        listing_id = self.request.query_params.get("listing")
+        date_from = self.request.query_params.get("from")
+        date_to = self.request.query_params.get("to")
+
+        if listing_id:
+            qs = qs.filter(listing_id=listing_id)
+        # Optional overlap filter: bookings that intersect [from, to]
+        if date_from and date_to:
+            qs = qs.filter(start_date__lte=date_to, end_date__gte=date_from)
+        return qs
+
+    def perform_create(self, serializer):
+        # Optional guardrails: basic validation (no past end date, start <= end)
+        start = serializer.validated_data.get("start_date")
+        end = serializer.validated_data.get("end_date")
+        if start and end and start > end:
+            return Response(
+                {"detail": "start_date must be before or equal to end_date."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if end and end < timezone.now().date():
+            return Response(
+                {"detail": "end_date cannot be in the past."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer.save()
