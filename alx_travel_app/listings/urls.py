@@ -1,14 +1,12 @@
-# alx_travel_app/listings/urls.py
+# listings/urls.py
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+from .views import ListingViewSet, BookingViewSet
 
-from django.urls import path
-from . import views
-
-app_name = "listings"
+router = DefaultRouter()
+router.register(r"listings", ListingViewSet, basename="listing")
+router.register(r"bookings", BookingViewSet, basename="booking")
 
 urlpatterns = [
-    path("listings/", views.ListingListCreateAPIView.as_view(), name="listing-list-create"),
-    path("listings/<int:pk>/", views.ListingRetrieveAPIView.as_view(), name="listing-detail"),
-    path("bookings/", views.BookingCreateAPIView.as_view(), name="booking-create"),
-    path("bookings/<int:pk>/", views.BookingRetrieveAPIView.as_view(), name="booking-detail"),
-    path("my-bookings/", views.UserBookingListAPIView.as_view(), name="user-bookings"),
+    path("", include(router.urls)),
 ]
